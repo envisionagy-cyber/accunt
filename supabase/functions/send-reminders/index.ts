@@ -1,0 +1,18 @@
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { corsHeaders } from '../_shared/cors.ts';
+const env=(k:string)=>Deno.env.get(k)||'';
+const out=(v:unknown,s=200)=>new Response(JSON.stringify(v),{status:s,headers:{...corsHeaders,'Content-Type':'application/json'}});
+function keys(){let pub=env('SUPABASE_ANON_KEY')||env('SUPABASE_PUBLISHABLE_KEY');if(!pub){try{pub=JSON.parse(env('SUPABASE_PUBLISHABLE_KEYS')).default||''}catch{}}let priv=env('SUPABASE_SERVICE_ROLE_KEY');if(!priv){try{priv=JSON.parse(env('SUPABASE_SECRET_KEYS')).default||''}catch{}}return {pub,priv,url:env('SUPABASE_URL')}}
+Deno.serve(async req=>{
+ if(req.method==='OPTIONS')return new Response('ok',{headers:corsHeaders});if(req.method!=='POST')return out({error:'POST required'},405);
+ try{const {url,pub,priv}=keys();if(!url||!priv)throw new Error('Supabase server secrets are not configured');const db=createClient(url,priv,{auth:{persistSession:false}});const auth=req.headers.get('Authorization')||'',cron=env('CRON_SECRET');let ok=!!cron&&auth===`Bearer ${cron}`;
+ if(!ok){const tok=auth.replace(/^Bearer\s+/i,'');if(!tok||!pub)return out({error:'Admin login required'},401);const u=createClient(url,pub,{global:{headers:{Authorization:`Bearer ${tok}`}},auth:{persistSession:false}});const {data:{user},error}=await u.auth.getUser(tok);if(error||!user)return out({error:'Invalid session'},401);const {data:p}=await db.from('profiles').select('role').eq('id',user.id).maybeSingle();if(p?.role!=='admin')return out({error:'Admin only'},403);ok=true}
+ const pid=env('WHATSAPP_PHONE_NUMBER_ID'),access=env('WHATSAPP_ACCESS_TOKEN'),version=env('WHATSAPP_API_VERSION'),template=env('WHATSAPP_TEMPLATE_NAME')||'invoice_payment_reminder',lang=env('WHATSAPP_TEMPLATE_LANGUAGE')||'en';if(!pid||!access||!version)return out({error:'WhatsApp secrets not configured'},503);
+ const {data:rows,error}=await db.from('invoices').select('*, clients(name,phone,whatsapp_opt_in)').neq('status','paid').neq('status','cancelled').neq('status','draft').order('due_date');if(error)throw error;const today=new Date().toISOString().slice(0,10);let sent=0,skipped=0,failed=0;
+ for(const i of rows||[]){if(i.due_date&&i.due_date>today){skipped++;continue}const c=i.clients;if(!c?.whatsapp_opt_in||!c?.phone){skipped++;continue}const {data:ps,error:pe}=await db.from('payments').select('amount').eq('invoice_id',i.id);if(pe)throw pe;const paid=(ps||[]).reduce((n,p)=>n+Number(p.amount||0),0),balance=Math.max(0,Number(i.total||0)-paid);if(balance<=.009){skipped++;continue}const phone=String(c.phone).replace(/\D/g,'');if(phone.length<10){skipped++;continue}
+ const msg={messaging_product:'whatsapp',to:phone,type:'template',template:{name:template,language:{code:lang},components:[{type:'body',parameters:[c.name||i.client_name_snapshot,i.invoice_number,i.due_date||'not set',balance.toFixed(2)].map(text=>({type:'text',text:String(text)}))}]}};
+ try{const response=await fetch(`https://graph.facebook.com/${version}/${pid}/messages`,{method:'POST',headers:{Authorization:`Bearer ${access}`,'Content-Type':'application/json'},body:JSON.stringify(msg)});const payload=await response.json();if(!response.ok)throw new Error(JSON.stringify(payload));sent++;await db.from('reminder_logs').insert({invoice_id:i.id,client_id:i.client_id,channel:'whatsapp',status:'sent',message:`Balance ${balance.toFixed(2)}`,provider_response:payload})}catch(e){failed++;await db.from('reminder_logs').insert({invoice_id:i.id,client_id:i.client_id,channel:'whatsapp',status:'failed',message:String(e)})}
+ }
+ return out({ok:failed===0,sent,skipped,failed});
+ }catch(e){return out({error:String(e)},500)}
+});
