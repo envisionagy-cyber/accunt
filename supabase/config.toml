@@ -1,0 +1,7 @@
+# These functions perform their own admin-JWT or CRON_SECRET verification.
+# Disable gateway JWT verification so CRON_SECRET bearer requests can reach them.
+[functions.generate-invoices]
+verify_jwt = false
+
+[functions.send-reminders]
+verify_jwt = false
